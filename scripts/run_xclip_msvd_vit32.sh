@@ -1,12 +1,13 @@
 # ViT-B/32
 job_name="xclip_msvd_vit32"
-DATA_PATH="[Your MSVD data and videos path]"
-python -m torch.distributed.launch --nproc_per_node=4 \
+DATA_PATH="/raid/user_data/jjhong/datasets"
+CUDA_VISIBLE_DEVICES=4,5,6,7
+python -m torch.distributed.run --nproc_per_node=4 --master_port=29504 \
     main_xclip.py --do_train --num_thread_reader=4 \
-    --epochs=5 --batch_size=300 --n_display=50 \
+    --epochs=3 --batch_size=320 --n_display=50 \
     --data_path ${DATA_PATH}/MSVD \
     --features_path ${DATA_PATH}/MSVD/MSVD_Videos \
-    --output_dir ckpts3/${job_name} \
+    --output_dir /raid/user_data/jjhong/ckpts/ckpts3/${job_name} \
     --lr 1e-4 --max_words 32 --max_frames 12 --batch_size_val 96 \
     --datatype msvd \
     --feature_framerate 1 --coef_lr 1e-3 \
