@@ -14,9 +14,66 @@ from modules.module_cross import CrossModel, CrossConfig, Transformer as Transfo
 from modules.module_clip import CLIP, convert_weights
 from modules.modeling import CLIP4ClipPreTrainedModel, show_log, update_attr, check_attr
 
+from torch.nn import init
+
 
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
+
+class TemporalAdapter(nn.Module):
+    def __init__(self, width, reduction=4, kernel_size=3):
+        super(TemporalAdapter, self).__init__()
+        hidden_dim = width // reduction
+        
+        self.down_proj = nn.Linear(width, hidden_dim)
+        self.act = nn.GELU()
+        
+        self.temporal_conv = nn.Conv1d(
+            hidden_dim, 
+            hidden_dim, 
+            kernel_size=kernel_size, 
+            padding=kernel_size//2, 
+            groups=hidden_dim 
+        )
+        
+        self.up_proj = nn.Linear(hidden_dim, width)
+        
+        init.zeros_(self.up_proj.weight)
+        init.zeros_(self.up_proj.bias)
+
+    def forward(self, x):
+        residual = x
+        
+        x = self.down_proj(x)
+        
+        x = x.permute(0, 2, 1)
+        x = self.temporal_conv(x)
+        x = x.permute(0, 2, 1)
+        
+        x = self.act(x)
+        x = self.up_proj(x)
+        
+        return residual + x
+    
+
+class TextAdapter(nn.Module):
+    def __init__(self, width, reduction=4):
+        super(TextAdapter, self).__init__()
+        hidden_dim = width // reduction
+        
+        self.down_proj = nn.Linear(width, hidden_dim)
+        self.act = nn.GELU()
+        self.up_proj = nn.Linear(hidden_dim, width)
+        
+        init.zeros_(self.up_proj.weight)
+        init.zeros_(self.up_proj.bias)
+
+    def forward(self, x):
+        residual = x
+        x = self.down_proj(x)
+        x = self.act(x)
+        x = self.up_proj(x)
+        return residual + x
 
 
 class XCLIP(CLIP4ClipPreTrainedModel):
@@ -142,6 +199,14 @@ class XCLIP(CLIP4ClipPreTrainedModel):
 
         self.loss_fct = CrossEn()
 
+        text_width = clip_state_dict["text_projection"].shape[1]
+        self.use_adapter = False
+        if hasattr(task_config, 'use_adapter') and task_config.use_adapter:
+            self.use_adapter = True
+            show_log(task_config, "\t [Info] Enabling Dual Adapters (Visual & Text).")
+            self.visual_adapter = TemporalAdapter(width=text_width)
+            self.text_adapter = TextAdapter(width=text_width)
+
         self.apply(self.init_weights)
 
     def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None):
@@ -197,6 +262,9 @@ class XCLIP(CLIP4ClipPreTrainedModel):
         bs_pair = video_mask.size(0)
         visual_hidden = self.clip.encode_image(video, video_frame=video_frame).float()
         visual_hidden = visual_hidden.view(bs_pair, -1, visual_hidden.size(-1))
+
+        if self.use_adapter:
+            visual_hidden = self.visual_adapter(visual_hidden)
 
         return visual_hidden
 
