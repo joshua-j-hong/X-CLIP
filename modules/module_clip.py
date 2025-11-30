@@ -493,6 +493,12 @@ class CLIP(nn.Module):
 
         # shape = [global_batch_size, global_batch_size]
         return logits_per_image, logits_per_text
+    
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        """
+        Stub function required by the PEFT LoraModel wrapper during initialization.
+        """
+        return None
 
 
 def convert_weights(model: nn.Module):

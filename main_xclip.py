@@ -18,6 +18,8 @@ from modules.optimization import BertAdam
 from util import parallel_apply, get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
 
+from peft import LoraConfig, get_peft_model
+
 torch.distributed.init_process_group(backend="nccl")
 
 global logger
@@ -106,6 +108,9 @@ def get_args(description='X-CLIP on Retrieval Task'):
 
     parser.add_argument('--use_adapter', action='store_true',
                         help='Enable TemporalAdapter and TextAdapter inside XCLIP.')
+    parser.add_argument('--adapter_type', type=str, default="bottleneck",
+                        choices=["bottleneck", "lora"],
+                        help="type of adapter to use.")
     parser.add_argument('--adapter_lr', type=float, default=1e-4,
                         help='Learning rate for adapters (and optionally mat weights).')
     parser.add_argument('--train_mat_weights', action='store_true', default=False,
@@ -175,6 +180,13 @@ def init_model(args, device, n_gpu, local_rank):
 
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
     model = XCLIP.from_pretrained(args.cross_model, cache_dir=cache_dir, state_dict=model_state_dict, task_config=args)
+    if (hasattr(args, 'adapter_type') and args.adapter_type == "lora"):
+        logger.info("\t [Info] Enabling LORA Adapters.")
+        # Apply LoRA to the CLIP encoders (Text and Vision)
+        model.peft_clip = get_peft_model(model.clip, model.lora_config)
+
+        logger.info("\t [Info] LORA Trainable Parameters Information.")
+        model.peft_clip.print_trainable_parameters()
     model.to(device)
     return model
 
@@ -302,6 +314,14 @@ def load_model(epoch, args, n_gpu, device, model_file=None):
             logger.info("Model loaded from %s", model_file)
         cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
         model = XCLIP.from_pretrained(args.cross_model, cache_dir=cache_dir, state_dict=model_state_dict, task_config=args)
+        if (hasattr(args, 'adapter_type') and args.adapter_type == "lora"):
+            logger.info("\t [Info] Enabling LORA Adapters.")
+            # Apply LoRA to the CLIP encoders (Text and Vision)
+            model.peft_clip = get_peft_model(model.clip, model.lora_config)
+
+            logger.info("\t [Info] LORA Trainable Parameters Information.")
+            model.peft_clip.print_trainable_parameters()
+
         model.to(device)
     else:
         model = None
@@ -482,12 +502,24 @@ def main():
         for name, param in model.clip.named_parameters():
             if name.find("ln_final.") == 0 or name.find("text_projection") == 0 or name.find("logit_scale") == 0 \
                     or name.find("visual.ln_post.") == 0 or name.find("visual.proj") == 0:
+                param.requires_grad = True
                 continue
             elif name.find("visual.transformer.resblocks.") == 0 or name.find("transformer.resblocks.") == 0:
                 layer_num = int(name.split(".resblocks.")[1].split(".")[0])
                 if layer_num >= args.freeze_layer_num:
+                    param.requires_grad = True
                     continue
+            elif "adapter" in name: 
+                logger.info("Adapter param found, keeping unfrozen, %s", name)
+                param.requires_grad = True
+                continue # Keep the adapter parameters trainable
+            elif "lora_" in name: 
+                logger.info("LORA param found, keeping unfrozen, %s", name)
+                param.requires_grad = True
+                continue # Keep the adapter parameters trainable
+            
             if args.linear_patch == "3d" and name.find("conv2."):
+                param.requires_grad = True
                 continue
             else:
                 param.requires_grad = False

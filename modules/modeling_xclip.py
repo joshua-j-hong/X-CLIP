@@ -14,46 +14,35 @@ from modules.module_cross import CrossModel, CrossConfig, Transformer as Transfo
 from modules.module_clip import CLIP, convert_weights
 from modules.modeling import CLIP4ClipPreTrainedModel, show_log, update_attr, check_attr
 
+from peft import LoraConfig, get_peft_model
+
 from torch.nn import init
 
 
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
 
-class TemporalAdapter(nn.Module):
-    def __init__(self, width, reduction=4, kernel_size=3):
-        super(TemporalAdapter, self).__init__()
+class VisualAdapter(nn.Module):
+    def __init__(self, width: int, reduction: int = 4):
+        super(VisualAdapter, self).__init__()
         hidden_dim = width // reduction
         
         self.down_proj = nn.Linear(width, hidden_dim)
         self.act = nn.GELU()
-        
-        self.temporal_conv = nn.Conv1d(
-            hidden_dim, 
-            hidden_dim, 
-            kernel_size=kernel_size, 
-            padding=kernel_size//2, 
-            groups=hidden_dim 
-        )
-        
         self.up_proj = nn.Linear(hidden_dim, width)
         
+        self.alpha = nn.Parameter(torch.zeros(1))
         init.zeros_(self.up_proj.weight)
         init.zeros_(self.up_proj.bias)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         
         x = self.down_proj(x)
-        
-        x = x.permute(0, 2, 1)
-        x = self.temporal_conv(x)
-        x = x.permute(0, 2, 1)
-        
         x = self.act(x)
         x = self.up_proj(x)
         
-        return residual + x
+        return residual + self.alpha * x
     
 
 class TextAdapter(nn.Module):
@@ -64,6 +53,7 @@ class TextAdapter(nn.Module):
         self.down_proj = nn.Linear(width, hidden_dim)
         self.act = nn.GELU()
         self.up_proj = nn.Linear(hidden_dim, width)
+        self.alpha = nn.Parameter(torch.zeros(1))
         
         init.zeros_(self.up_proj.weight)
         init.zeros_(self.up_proj.bias)
@@ -73,7 +63,8 @@ class TextAdapter(nn.Module):
         x = self.down_proj(x)
         x = self.act(x)
         x = self.up_proj(x)
-        return residual + x
+
+        return residual + self.alpha * x
 
 
 class XCLIP(CLIP4ClipPreTrainedModel):
@@ -198,16 +189,30 @@ class XCLIP(CLIP4ClipPreTrainedModel):
         self.word_mat_weight2 = nn.parameter.Parameter(torch.eye(num_words), requires_grad=True)
 
         self.loss_fct = CrossEn()
+        self.apply(self.init_weights)
 
         text_width = clip_state_dict["text_projection"].shape[1]
         self.use_adapter = False
+        self.adapter_type = "bottleneck"
         if hasattr(task_config, 'use_adapter') and task_config.use_adapter:
             self.use_adapter = True
-            show_log(task_config, "\t [Info] Enabling Dual Adapters (Visual & Text).")
-            self.visual_adapter = TemporalAdapter(width=text_width)
-            self.text_adapter = TextAdapter(width=text_width)
-
-        self.apply(self.init_weights)
+            if (hasattr(task_config, 'adapter_type') and task_config.adapter_type == "bottleneck"):
+                self.adapter_type = task_config.adapter_type
+                show_log(task_config, "\t [Info] Enabling Dual Adapters (Visual & Text).")
+                self.visual_adapter = VisualAdapter(width=text_width)
+                self.text_adapter = TextAdapter(width=text_width)
+            elif (hasattr(task_config, 'adapter_type') and task_config.adapter_type == "lora"):
+                self.adapter_type = task_config.adapter_type
+                # Configuration for LoRA
+                self.lora_config = LoraConfig(
+                    r=8,  # LoRA rank (e.g., 8 or 16)
+                    lora_alpha=16, # Scaling factor
+                    target_modules=["mlp.c_fc", "mlp.c_proj"],
+                    lora_dropout=0.05,
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                )
+                # Create LORA after loading all parameters.
 
     def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
@@ -245,9 +250,18 @@ class XCLIP(CLIP4ClipPreTrainedModel):
             attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
 
         bs_pair = input_ids.size(0)
-        sequence_hidden, seq_features = self.clip.encode_text(input_ids, return_hidden=True)
+
+        if self.use_adapter and self.adapter_type == "lora":
+            sequence_hidden, seq_features = self.peft_clip.encode_text(input_ids, return_hidden=True)
+        else:
+            sequence_hidden, seq_features = self.clip.encode_text(input_ids, return_hidden=True)
         sequence_hidden, seq_features = sequence_hidden.float(), seq_features.float()
         sequence_hidden = sequence_hidden.view(bs_pair, -1, sequence_hidden.size(-1))
+
+        if self.use_adapter and self.adapter_type == "bottleneck":
+            seq_features = self.text_adapter(seq_features) 
+            
+            sequence_hidden = self.text_adapter(sequence_hidden)
 
         return sequence_hidden, seq_features
 
@@ -260,10 +274,13 @@ class XCLIP(CLIP4ClipPreTrainedModel):
             video_frame = bs * ts
 
         bs_pair = video_mask.size(0)
-        visual_hidden = self.clip.encode_image(video, video_frame=video_frame).float()
+        if self.use_adapter and self.adapter_type == "lora":
+            visual_hidden = self.peft_clip.encode_image(video, video_frame=video_frame).float()
+        else:
+            visual_hidden = self.clip.encode_image(video, video_frame=video_frame).float()
         visual_hidden = visual_hidden.view(bs_pair, -1, visual_hidden.size(-1))
 
-        if self.use_adapter:
+        if self.use_adapter and self.adapter_type == "bottleneck":
             visual_hidden = self.visual_adapter(visual_hidden)
 
         return visual_hidden
@@ -375,7 +392,10 @@ class XCLIP(CLIP4ClipPreTrainedModel):
         # word-level textual features
         word_features = seq_features / seq_features.norm(dim=-1, keepdim=True)                   # [bs, num_words, dim]
 
-        logit_scale = self.clip.logit_scale.exp()
+        if self.use_adapter and self.adapter_type == "lora":
+            logit_scale = self.peft_clip.logit_scale.exp()
+        else:
+            logit_scale = self.clip.logit_scale.exp()
 
         if self.training:
             video_output = allgather(video_output, self.task_config)
