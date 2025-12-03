@@ -113,6 +113,9 @@ def get_args(description='X-CLIP on Retrieval Task'):
                         help="type of adapter to use.")
     parser.add_argument('--adapter_lr', type=float, default=1e-4,
                         help='Learning rate for adapters (and optionally mat weights).')
+    parser.add_argument('--adapter_lora_rank', type=int, default=8,
+                        choices=[8, 16, 32, 64, 128, 256],
+                        help="Rank to use for LORA.")
     parser.add_argument('--train_mat_weights', action='store_true', default=False,
                         help='Also train *_mat_weight parameters with adapter_lr.')
 
@@ -591,7 +594,7 @@ def main():
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
 
         if args.local_rank == 0:
-            model = load_model(-1, args, n_gpu, device, model_file=best_output_model_file)
+            # model = load_model(-1, args, n_gpu, device, model_file=best_output_model_file)
             eval_epoch(args, model, test_dataloader, device, n_gpu)
 
     elif args.do_eval:

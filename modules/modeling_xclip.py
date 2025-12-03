@@ -205,12 +205,12 @@ class XCLIP(CLIP4ClipPreTrainedModel):
                 self.adapter_type = task_config.adapter_type
                 # Configuration for LoRA
                 self.lora_config = LoraConfig(
-                    r=8,  # LoRA rank (e.g., 8 or 16)
+                    r=task_config.adapter_lora_rank,  # LoRA rank (e.g., 8 or 16)
                     lora_alpha=16, # Scaling factor
-                    target_modules=["mlp.c_fc", "mlp.c_proj"],
+                    target_modules=["attn.in_proj_weight", "attn.out_proj.weight", "mlp.c_fc", "mlp.c_proj"],
                     lora_dropout=0.05,
                     bias="none",
-                    task_type="CAUSAL_LM",
+                    task_type="FEATURE_EXTRACTION",
                 )
                 # Create LORA after loading all parameters.
 
