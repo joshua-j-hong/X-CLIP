@@ -20,6 +20,31 @@ from torch.nn import init
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
 
+class VisualFeatureAdapter(nn.Module): 
+    def __init__(self, width: int, reduction: int = 4): 
+        super().__init__() 
+        hid = max(1, width // reduction) 
+        self.down = nn.Linear(width, hid, bias=True) 
+        self.act = nn.GELU() 
+        self.up = nn.Linear(hid, width, bias=True) 
+        nn.init.zeros_(self.up.weight) 
+        nn.init.zeros_(self.up.bias) 
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor: 
+        need_view = False 
+        if x.dim() == 3: 
+            B, T, D = x.shape 
+            x = x.reshape(B*T, D) 
+            need_view = True 
+            residual = x 
+            x = self.down(x) 
+            x = self.act(x) 
+            x = self.up(x) 
+            x = x + residual 
+            if need_view: 
+                x = x.view(B, T, -1) 
+        return x
+
 class TemporalAdapter(nn.Module):
     def __init__(self, width, reduction=4, kernel_size=3):
         super(TemporalAdapter, self).__init__()
@@ -54,26 +79,46 @@ class TemporalAdapter(nn.Module):
         x = self.up_proj(x)
         
         return residual + x
-    
 
 class TextAdapter(nn.Module):
-    def __init__(self, width, reduction=4):
+    def __init__(self, width, reduction=4, kernel_size=3):
         super(TextAdapter, self).__init__()
         hidden_dim = width // reduction
+        self.norm = nn.LayerNorm(width)
         
         self.down_proj = nn.Linear(width, hidden_dim)
+        
+        self.conv = nn.Conv1d(
+            in_channels=hidden_dim, 
+            out_channels=hidden_dim, 
+            kernel_size=kernel_size, 
+            padding=kernel_size // 2, 
+            groups=hidden_dim
+        )
+        
         self.act = nn.GELU()
+        
         self.up_proj = nn.Linear(hidden_dim, width)
         
+        self.scale = nn.Parameter(torch.ones(1) * 1e-4)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        init.kaiming_normal_(self.down_proj.weight, mode='fan_out', nonlinearity='linear')
         init.zeros_(self.up_proj.weight)
         init.zeros_(self.up_proj.bias)
 
     def forward(self, x):
         residual = x
+        x = self.norm(x)
         x = self.down_proj(x)
+        x = x.transpose(1, 2) 
+        x = self.conv(x)
+        x = x.transpose(1, 2)
         x = self.act(x)
         x = self.up_proj(x)
-        return residual + x
+        return residual + x * self.scale
 
 
 class XCLIP(CLIP4ClipPreTrainedModel):
@@ -248,6 +293,10 @@ class XCLIP(CLIP4ClipPreTrainedModel):
         sequence_hidden, seq_features = self.clip.encode_text(input_ids, return_hidden=True)
         sequence_hidden, seq_features = sequence_hidden.float(), seq_features.float()
         sequence_hidden = sequence_hidden.view(bs_pair, -1, sequence_hidden.size(-1))
+
+        if self.use_adapter:
+            seq_features = self.text_adapter(seq_features)
+            sequence_hidden = self.text_adapter(sequence_hidden)
 
         return sequence_hidden, seq_features
 
