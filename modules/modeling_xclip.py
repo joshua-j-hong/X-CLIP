@@ -252,6 +252,7 @@ class XCLIP(CLIP4ClipPreTrainedModel):
         bs_pair = input_ids.size(0)
 
         if self.use_adapter and self.adapter_type == "lora":
+            print("SEQUENCE CHECK\n")
             sequence_hidden, seq_features = self.peft_clip.encode_text(input_ids, return_hidden=True)
         else:
             sequence_hidden, seq_features = self.clip.encode_text(input_ids, return_hidden=True)
@@ -275,6 +276,7 @@ class XCLIP(CLIP4ClipPreTrainedModel):
 
         bs_pair = video_mask.size(0)
         if self.use_adapter and self.adapter_type == "lora":
+            print("VISUAL CHECK\n")
             visual_hidden = self.peft_clip.encode_image(video, video_frame=video_frame).float()
         else:
             visual_hidden = self.clip.encode_image(video, video_frame=video_frame).float()

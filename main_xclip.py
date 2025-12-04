@@ -527,6 +527,12 @@ def main():
             else:
                 param.requires_grad = False
 
+    for name, param in model.peft_model.named_parameters():
+        print(f"{name}: {param.requires_grad}")
+
+    for name, param in model.clip.named_parameters():
+        print(f"{name}: {param.requires_grad}")
+
     assert args.datatype in DATALOADER_DICT
     assert DATALOADER_DICT[args.datatype]["test"] is not None \
            or DATALOADER_DICT[args.datatype]["val"] is not None
