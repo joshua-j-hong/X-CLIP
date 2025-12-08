@@ -206,8 +206,8 @@ class XCLIP(CLIP4ClipPreTrainedModel):
                 # Configuration for LoRA
                 self.lora_config = LoraConfig(
                     r=task_config.adapter_lora_rank,  # LoRA rank (e.g., 8 or 16)
-                    lora_alpha=16, # Scaling factor
-                    target_modules=["attn.in_proj_weight", "attn.out_proj.weight", "mlp.c_fc", "mlp.c_proj"],
+                    lora_alpha=task_config.adapter_lora_rank, # Scaling factor
+                    target_modules=["attn", "mlp.c_fc", "mlp.c_proj"],
                     lora_dropout=0.05,
                     bias="none",
                     task_type="FEATURE_EXTRACTION",
@@ -252,7 +252,6 @@ class XCLIP(CLIP4ClipPreTrainedModel):
         bs_pair = input_ids.size(0)
 
         if self.use_adapter and self.adapter_type == "lora":
-            print("SEQUENCE CHECK\n")
             sequence_hidden, seq_features = self.peft_clip.encode_text(input_ids, return_hidden=True)
         else:
             sequence_hidden, seq_features = self.clip.encode_text(input_ids, return_hidden=True)
@@ -276,7 +275,6 @@ class XCLIP(CLIP4ClipPreTrainedModel):
 
         bs_pair = video_mask.size(0)
         if self.use_adapter and self.adapter_type == "lora":
-            print("VISUAL CHECK\n")
             visual_hidden = self.peft_clip.encode_image(video, video_frame=video_frame).float()
         else:
             visual_hidden = self.clip.encode_image(video, video_frame=video_frame).float()

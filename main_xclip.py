@@ -114,7 +114,7 @@ def get_args(description='X-CLIP on Retrieval Task'):
     parser.add_argument('--adapter_lr', type=float, default=1e-4,
                         help='Learning rate for adapters (and optionally mat weights).')
     parser.add_argument('--adapter_lora_rank', type=int, default=8,
-                        choices=[8, 16, 32, 64, 128, 256],
+                        choices=[4, 8, 16, 32, 64, 128, 256],
                         help="Rank to use for LORA.")
     parser.add_argument('--train_mat_weights', action='store_true', default=False,
                         help='Also train *_mat_weight parameters with adapter_lr.')
@@ -203,7 +203,7 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
     def is_adapter_param(name: str) -> bool:
-        if ('visual_adapter' in name) or ('text_adapter' in name):
+        if ('visual_adapter' in name) or ('text_adapter' in name) or ('lora_' in name):
             return True
         if args.train_mat_weights and (
             name.endswith('global_mat_weight') or
@@ -503,23 +503,29 @@ def main():
     assert args.freeze_layer_num <= 12 and args.freeze_layer_num >= -1
     if hasattr(model, "clip") and args.freeze_layer_num > -1:
         for name, param in model.clip.named_parameters():
+            # Layer Normalization layers
+            if "ln_" in name:
+                param.requires_grad = True
+                continue
+            # Embedding layers
+            if "embedding" in name:
+                param.requires_grad = True
+                continue
             if name.find("ln_final.") == 0 or name.find("text_projection") == 0 or name.find("logit_scale") == 0 \
                     or name.find("visual.ln_post.") == 0 or name.find("visual.proj") == 0:
                 param.requires_grad = True
                 continue
+            elif "adapter" in name: 
+                param.requires_grad = True
+                continue # Keep the adapter parameters trainable
+            elif "lora_" in name: 
+                param.requires_grad = True
+                continue # Keep the adapter parameters trainable
             elif name.find("visual.transformer.resblocks.") == 0 or name.find("transformer.resblocks.") == 0:
                 layer_num = int(name.split(".resblocks.")[1].split(".")[0])
                 if layer_num >= args.freeze_layer_num:
                     param.requires_grad = True
                     continue
-            elif "adapter" in name: 
-                logger.info("Adapter param found, keeping unfrozen, %s", name)
-                param.requires_grad = True
-                continue # Keep the adapter parameters trainable
-            elif "lora_" in name: 
-                logger.info("LORA param found, keeping unfrozen, %s", name)
-                param.requires_grad = True
-                continue # Keep the adapter parameters trainable
             
             if args.linear_patch == "3d" and name.find("conv2."):
                 param.requires_grad = True
@@ -527,11 +533,11 @@ def main():
             else:
                 param.requires_grad = False
 
-    for name, param in model.peft_model.named_parameters():
-        print(f"{name}: {param.requires_grad}")
-
-    for name, param in model.clip.named_parameters():
-        print(f"{name}: {param.requires_grad}")
+    if args.local_rank == 0:
+        if (hasattr(model, "peft_clip")):
+            logger.info("Printing PEFT CLIP parameters and their trainable status:")
+            for name, param in model.peft_clip.named_parameters():
+                logger.info(f"{name}: {param.requires_grad}")
 
     assert args.datatype in DATALOADER_DICT
     assert DATALOADER_DICT[args.datatype]["test"] is not None \
