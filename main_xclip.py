@@ -535,9 +535,34 @@ def main():
 
     if args.local_rank == 0:
         if (hasattr(model, "peft_clip")):
+            total_params = 0
+            trainable_params = 0
+
             logger.info("Printing PEFT CLIP parameters and their trainable status:")
             for name, param in model.peft_clip.named_parameters():
-                logger.info(f"{name}: {param.requires_grad}")
+                num_params = param.numel()
+                total_params += num_params
+                if param.requires_grad:
+                    trainable_params += num_params
+                # logger.info(f"{name}: {param.requires_grad}")
+
+            logger.info("--- Parameter Summary for model.peft_clip ---")
+            logger.info(f"Total parameters: {total_params:,}")
+            logger.info(f"Trainable parameters: {trainable_params:,}")
+
+        elif (hasattr(model, "clip")):
+            total_params = 0
+            trainable_params = 0
+
+            for name, param in model.clip.named_parameters():
+                num_params = param.numel()
+                total_params += num_params
+                if param.requires_grad:
+                    trainable_params += num_params
+
+            logger.info("--- Parameter Summary for model.clip ---")
+            logger.info(f"Total parameters: {total_params:,}")
+            logger.info(f"Trainable parameters: {trainable_params:,}")
 
     assert args.datatype in DATALOADER_DICT
     assert DATALOADER_DICT[args.datatype]["test"] is not None \
