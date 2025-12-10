@@ -251,6 +251,18 @@ class XCLIP(CLIP4ClipPreTrainedModel):
             show_log(task_config, "\t [Info] Enabling Dual Adapters (Visual & Text).")
             self.visual_adapter = TemporalAdapter(width=text_width)
             self.text_adapter = TextAdapter(width=text_width)
+            
+        self.use_text_adapter = False
+        if hasattr(task_config, 'use_text_adapter') and task_config.use_text_adapter:
+            self.use_text_adapter = True
+            show_log(task_config, "\t [Info] Enabling Text Adapter.")
+            self.text_adapter = TextAdapter(width=text_width)
+
+        self.use_temporal_adapter = False
+        if hasattr(task_config, 'use_temporal_adapter') and task_config.use_temporal_adapter:
+            self.use_temporal_adapter = True
+            show_log(task_config, "\t [Info] Enabling Temporal Adapter.")
+            self.visual_adapter = TemporalAdapter(width=text_width)
 
         self.apply(self.init_weights)
 
@@ -294,7 +306,7 @@ class XCLIP(CLIP4ClipPreTrainedModel):
         sequence_hidden, seq_features = sequence_hidden.float(), seq_features.float()
         sequence_hidden = sequence_hidden.view(bs_pair, -1, sequence_hidden.size(-1))
 
-        if self.use_adapter:
+        if self.use_adapter or self.use_text_adapter:
             seq_features = self.text_adapter(seq_features)
             sequence_hidden = self.text_adapter(sequence_hidden)
 
@@ -312,7 +324,7 @@ class XCLIP(CLIP4ClipPreTrainedModel):
         visual_hidden = self.clip.encode_image(video, video_frame=video_frame).float()
         visual_hidden = visual_hidden.view(bs_pair, -1, visual_hidden.size(-1))
 
-        if self.use_adapter:
+        if self.use_adapter or self.use_temporal_adapter:
             visual_hidden = self.visual_adapter(visual_hidden)
 
         return visual_hidden

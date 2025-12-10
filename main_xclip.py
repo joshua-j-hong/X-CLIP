@@ -106,6 +106,10 @@ def get_args(description='X-CLIP on Retrieval Task'):
 
     parser.add_argument('--use_adapter', action='store_true',
                         help='Enable TemporalAdapter and TextAdapter inside XCLIP.')
+    parser.add_argument('--use_text_adapter', action='store_true',
+                        help='Enable TextAdapter inside XCLIP.')
+    parser.add_argument('--use_temporal_adapter', action='store_true',
+                        help='Enable TemporalAdapter inside XCLIP.')
     parser.add_argument('--adapter_lr', type=float, default=1e-4,
                         help='Learning rate for adapters (and optionally mat weights).')
     parser.add_argument('--train_mat_weights', action='store_true', default=False,
@@ -491,6 +495,31 @@ def main():
                 continue
             else:
                 param.requires_grad = False
+
+    if args.local_rank == 0:
+        if (hasattr(model, "clip")):
+            total_params = 0
+            trainable_params = 0
+            for name, param in model.clip.named_parameters():
+                num_params = param.numel()
+                total_params += num_params
+                if param.requires_grad:
+                    trainable_params += num_params
+            logger.info("--- Parameter Summary for model.clip ---")
+            logger.info(f"Total parameters: {total_params:,}")
+            logger.info(f"Trainable parameters: {trainable_params:,}")
+        if (hasattr(model, "text_adapter") or hasattr(model, "visual_adapter")):
+            total_params = 0
+            trainable_params = 0
+            for name, param in model.named_parameters():
+                if 'text_adapter' in name or 'visual_adapter' in name:
+                    num_params = param.numel()
+                    total_params += num_params
+                    if param.requires_grad:
+                        trainable_params += num_params
+            logger.info("--- Parameter Summary for adapters ---")
+            logger.info(f"Total parameters: {total_params:,}")
+            logger.info(f"Trainable parameters: {trainable_params:,}")
 
     assert args.datatype in DATALOADER_DICT
     assert DATALOADER_DICT[args.datatype]["test"] is not None \
