@@ -2,7 +2,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import unicode_literals
 from __future__ import print_function
-
 import torch
 import numpy as np
 import random
@@ -14,11 +13,16 @@ from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from modules.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from modules.modeling_xclip import XCLIP
 from modules.optimization import BertAdam
-
 from util import parallel_apply, get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
 
 torch.distributed.init_process_group(backend="nccl")
+from torch.backends.cuda import sdp_kernel
+sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
 global logger
 
@@ -27,12 +31,10 @@ def get_args(description='X-CLIP on Retrieval Task'):
     parser.add_argument("--do_pretrain", action='store_true', help="Whether to run training.")
     parser.add_argument("--do_train", action='store_true', help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true', help="Whether to run eval on the dev set.")
-
     parser.add_argument('--train_csv', type=str, default='data/.train.csv', help='')
     parser.add_argument('--val_csv', type=str, default='data/.val.csv', help='')
     parser.add_argument('--data_path', type=str, default='data/caption.pickle', help='data pickle file path')
     parser.add_argument('--features_path', type=str, default='data/videos_feature.pickle', help='feature path')
-
     parser.add_argument('--num_thread_reader', type=int, default=1, help='')
     parser.add_argument('--lr', type=float, default=0.0001, help='initial learning rate')
     parser.add_argument('--epochs', type=int, default=20, help='upper epoch limit')
@@ -49,7 +51,6 @@ def get_args(description='X-CLIP on Retrieval Task'):
     parser.add_argument('--hard_negative_rate', type=float, default=0.5, help='rate of intra negative sample')
     parser.add_argument('--negative_weighting', type=int, default=1, help='Weight the loss for intra negative')
     parser.add_argument('--n_pair', type=int, default=1, help='Num of pair to output from data loader')
-
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
     parser.add_argument("--cross_model", default="cross-base", type=str, required=False, help="Cross module")
@@ -61,38 +62,30 @@ def get_args(description='X-CLIP on Retrieval Task'):
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
     parser.add_argument('--n_gpu', type=int, default=1, help="Changed in the execute process.")
-
     parser.add_argument("--cache_dir", default="", type=str,
                         help="Where do you want to store the pre-trained models downloaded from s3")
-
     parser.add_argument('--fp16', action='store_true',
                         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit")
     parser.add_argument('--fp16_opt_level', type=str, default='O1',
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
-
     parser.add_argument("--task_type", default="retrieval", type=str, help="Point the task `retrieval` to finetune.")
     parser.add_argument("--datatype", default="msrvtt", type=str, help="Point the dataset to finetune.")
-
     parser.add_argument("--world_size", default=0, type=int, help="distribted training")
     parser.add_argument("--local_rank", default=int(os.environ.get("LOCAL_RANK", 0)), type=int, help="Local rank for distributed training")
     parser.add_argument("--rank", default=0, type=int, help="distribted training")
     parser.add_argument('--coef_lr', type=float, default=1., help='coefficient for bert branch.')
     parser.add_argument('--use_mil', action='store_true', help="Whether use MIL as Miech et. al. (2020).")
     parser.add_argument('--sampled_use_mil', action='store_true', help="Whether MIL, has a high priority than use_mil.")
-
     parser.add_argument('--text_num_hidden_layers', type=int, default=12, help="Layer NO. of text.")
     parser.add_argument('--visual_num_hidden_layers', type=int, default=12, help="Layer NO. of visual.")
     parser.add_argument('--cross_num_hidden_layers', type=int, default=4, help="Layer NO. of cross.")
-
     parser.add_argument('--loose_type', action='store_true', help="Default using tight type for retrieval.")
     parser.add_argument('--expand_msrvtt_sentences', action='store_true', help="")
-
     parser.add_argument('--train_frame_order', type=int, default=0, choices=[0, 1, 2],
                         help="Frame order, 0: ordinary order; 1: reverse order; 2: random order.")
     parser.add_argument('--eval_frame_order', type=int, default=0, choices=[0, 1, 2],
                         help="Frame order, 0: ordinary order; 1: reverse order; 2: random order.")
-
     parser.add_argument('--freeze_layer_num', type=int, default=0, help="Layer NO. of CLIP need to freeze.")
     parser.add_argument('--slice_framepos', type=int, default=0, choices=[0, 1, 2],
                         help="0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly.")
@@ -101,123 +94,164 @@ def get_args(description='X-CLIP on Retrieval Task'):
     parser.add_argument('--sim_header', type=str, default="meanP",
                         choices=["meanP", "seqLSTM", "seqTransf", "tightTransf"],
                         help="choice a similarity header.")
-
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
-
+    parser.add_argument('--use_adapter', action='store_true', 
+                        help='Whether to use adapters (LoRM + ASA) in CLIP visual encoder')
+    parser.add_argument('--adapter_only', action='store_true', 
+                        help='Whether to train only adapter parameters (freeze CLIP backbone)')
+    parser.add_argument('--adapter_lr', type=float, default=1e-3, 
+                        help='Learning rate for adapter parameters')
+    parser.add_argument('--lorm_rank', type=int, default=3, 
+                        help='Rank for LoRM (Low-Rank Modulation) adapter')
+    parser.add_argument('--lorm_dropout', type=float, default=0.0, 
+                        help='Dropout rate for LoRM adapter')
+    parser.add_argument('--asa_topk_fixed', type=int, default=3, 
+                        help='Top-k tokens for ASA (Asynchronous Sparse Attention) adapter')
+    parser.add_argument('--asa_max_off', type=int, default=2, 
+                        help='Maximum temporal offset for ASA adapter')
     args = parser.parse_args()
-
     if args.sim_header == "tightTransf":
         args.loose_type = False
-
-    # Check paramenters
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
             args.gradient_accumulation_steps))
     if not args.do_train and not args.do_eval:
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
-
     args.batch_size = int(args.batch_size / args.gradient_accumulation_steps)
-
+    if args.use_adapter:
+        if 'lorm_rank' not in args.__dict__ or args.lorm_rank is None:
+            args.lorm_rank = 3
+        if 'asa_topk_fixed' not in args.__dict__ or args.asa_topk_fixed is None:
+            args.asa_topk_fixed = 3
+        if 'asa_max_off' not in args.__dict__ or args.asa_max_off is None:
+            args.asa_max_off = 2
+        if args.lr > 5e-5:
+            args.lr = 5e-5
     return args
 
 def set_seed_logger(args):
     global logger
-    # predefining random initial seeds
     random.seed(args.seed)
     os.environ['PYTHONHASHSEED'] = str(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)  # if you are using multi-GPU.
+    torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-
     world_size = torch.distributed.get_world_size()
     torch.cuda.set_device(args.local_rank)
     args.world_size = world_size
     rank = torch.distributed.get_rank()
     args.rank = rank
-
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
-
     logger = get_logger(os.path.join(args.output_dir, "log.txt"))
-
     if args.local_rank == 0:
         logger.info("Effective parameters:")
         for key in sorted(args.__dict__):
             logger.info("  <<< {}: {}".format(key, args.__dict__[key]))
-
     return args
 
 def init_device(args, local_rank):
     global logger
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu", local_rank)
-
     n_gpu = torch.cuda.device_count()
     logger.info("device: {} n_gpu: {}".format(device, n_gpu))
     args.n_gpu = n_gpu
-
     if args.batch_size % args.n_gpu != 0 or args.batch_size_val % args.n_gpu != 0:
         raise ValueError("Invalid batch_size/batch_size_val and n_gpu parameter: {}%{} and {}%{}, should be == 0".format(
             args.batch_size, args.n_gpu, args.batch_size_val, args.n_gpu))
-
     return device, n_gpu
 
 def init_model(args, device, n_gpu, local_rank):
-
     if args.init_model:
         model_state_dict = torch.load(args.init_model, map_location='cpu')
     else:
         model_state_dict = None
-
-    # Prepare model
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
     model = XCLIP.from_pretrained(args.cross_model, cache_dir=cache_dir, state_dict=model_state_dict, task_config=args)
-
     model.to(device)
-
     return model
 
 def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, local_rank, coef_lr=1.):
-
     if hasattr(model, 'module'):
         model = model.module
-
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-
-    decay_param_tp = [(n, p) for n, p in param_optimizer if not any(nd in n for nd in no_decay)]
-    no_decay_param_tp = [(n, p) for n, p in param_optimizer if any(nd in n for nd in no_decay)]
-
-    decay_clip_param_tp = [(n, p) for n, p in decay_param_tp if "clip." in n]
-    decay_noclip_param_tp = [(n, p) for n, p in decay_param_tp if "clip." not in n]
-
-    no_decay_clip_param_tp = [(n, p) for n, p in no_decay_param_tp if "clip." in n]
-    no_decay_noclip_param_tp = [(n, p) for n, p in no_decay_param_tp if "clip." not in n]
-
-    weight_decay = 0.2
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in decay_clip_param_tp], 'weight_decay': weight_decay, 'lr': args.lr * coef_lr},
-        {'params': [p for n, p in decay_noclip_param_tp], 'weight_decay': weight_decay},
-        {'params': [p for n, p in no_decay_clip_param_tp], 'weight_decay': 0.0, 'lr': args.lr * coef_lr},
-        {'params': [p for n, p in no_decay_noclip_param_tp], 'weight_decay': 0.0}
-    ]
-
+    if hasattr(args, 'use_adapter') and args.use_adapter and hasattr(args, 'adapter_lr'):
+        adapter_params = []
+        non_adapter_params = []
+        for n, p in param_optimizer:
+            if not p.requires_grad:
+                continue
+            if 'lorm.' in n or 'off_param' in n or 'gamma' in n or 'beta' in n or 'score_net' in n:
+                adapter_params.append((n, p))
+            else:
+                non_adapter_params.append((n, p))
+        decay_adapter = [(n, p) for n, p in adapter_params if not any(nd in n for nd in no_decay)]
+        no_decay_adapter = [(n, p) for n, p in adapter_params if any(nd in n for nd in no_decay)]
+        decay_non_adapter = [(n, p) for n, p in non_adapter_params if not any(nd in n for nd in no_decay)]
+        no_decay_non_adapter = [(n, p) for n, p in non_adapter_params if any(nd in n for nd in no_decay)]
+        decay_clip = [(n, p) for n, p in decay_non_adapter if "clip." in n]
+        decay_noclip = [(n, p) for n, p in decay_non_adapter if "clip." not in n]
+        no_decay_clip = [(n, p) for n, p in no_decay_non_adapter if "clip." in n]
+        no_decay_noclip = [(n, p) for n, p in no_decay_non_adapter if "clip." not in n]
+        weight_decay = 0.2
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in decay_adapter], 'weight_decay': weight_decay, 'lr': args.adapter_lr},
+            {'params': [p for n, p in no_decay_adapter], 'weight_decay': 0.0, 'lr': args.adapter_lr},
+            {'params': [p for n, p in decay_clip], 'weight_decay': weight_decay, 'lr': args.lr * coef_lr},
+            {'params': [p for n, p in no_decay_clip], 'weight_decay': 0.0, 'lr': args.lr * coef_lr},
+            {'params': [p for n, p in decay_noclip], 'weight_decay': weight_decay},
+            {'params': [p for n, p in no_decay_noclip], 'weight_decay': 0.0}
+        ]
+        if args.local_rank == 0:
+            logger.info("***** Adapter Mode Optimizer Configuration *****")
+            logger.info("  Adapter parameters (lr={}): {}".format(args.adapter_lr, len(adapter_params)))
+            logger.info("  CLIP parameters (lr={}): {}".format(args.lr * coef_lr, len(decay_clip) + len(no_decay_clip)))
+            logger.info("  Other parameters (lr={}): {}".format(args.lr, len(decay_noclip) + len(no_decay_noclip)))
+    else:
+        decay_param_tp = [(n, p) for n, p in param_optimizer if not any(nd in n for nd in no_decay)]
+        no_decay_param_tp = [(n, p) for n, p in param_optimizer if any(nd in n for nd in no_decay)]
+        decay_clip_param_tp = [(n, p) for n, p in decay_param_tp if "clip." in n]
+        decay_noclip_param_tp = [(n, p) for n, p in decay_param_tp if "clip." not in n]
+        no_decay_clip_param_tp = [(n, p) for n, p in no_decay_param_tp if "clip." in n]
+        no_decay_noclip_param_tp = [(n, p) for n, p in no_decay_param_tp if "clip." not in n]
+        weight_decay = 0.2
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in decay_clip_param_tp], 'weight_decay': weight_decay, 'lr': args.lr * coef_lr},
+            {'params': [p for n, p in decay_noclip_param_tp], 'weight_decay': weight_decay},
+            {'params': [p for n, p in no_decay_clip_param_tp], 'weight_decay': 0.0, 'lr': args.lr * coef_lr},
+            {'params': [p for n, p in no_decay_noclip_param_tp], 'weight_decay': 0.0}
+        ]
     scheduler = None
     optimizer = BertAdam(optimizer_grouped_parameters, lr=args.lr, warmup=args.warmup_proportion,
                          schedule='warmup_cosine', b1=0.9, b2=0.98, e=1e-6,
                          t_total=num_train_optimization_steps, weight_decay=weight_decay,
                          max_grad_norm=1.0)
-
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
                                                       output_device=local_rank, find_unused_parameters=True)
-
+    class _LogitScaleWarmup:
+        def __init__(self, module, steps=1000):
+            self.module = module
+            self.steps = steps
+            self._cnt = 0
+            if hasattr(module, 'module'):
+                self._p = module.module.clip.logit_scale
+            else:
+                self._p = module.clip.logit_scale
+            self._orig_requires_grad = self._p.requires_grad
+            self._p.requires_grad_(False)
+        def step(self):
+            if self._cnt < self.steps:
+                self._cnt += 1
+                if self._cnt == self.steps:
+                    self._p.requires_grad_(self._orig_requires_grad)
+    model._ls_warmup = _LogitScaleWarmup(model, steps=int(1000))
     return optimizer, scheduler, model
 
 def save_model(epoch, args, model, optimizer, tr_loss, type_name=""):
-    # Only save the model it-self
     model_to_save = model.module if hasattr(model, 'module') else model
     output_model_file = os.path.join(
         args.output_dir, "pytorch_model.bin.{}{}".format("" if type_name=="" else type_name+".", epoch))
@@ -240,10 +274,8 @@ def load_model(epoch, args, n_gpu, device, model_file=None):
         model_state_dict = torch.load(model_file, map_location='cpu')
         if args.local_rank == 0:
             logger.info("Model loaded from %s", model_file)
-        # Prepare model
         cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
         model = XCLIP.from_pretrained(args.cross_model, cache_dir=cache_dir, state_dict=model_state_dict, task_config=args)
-
         model.to(device)
     else:
         model = None
@@ -256,39 +288,35 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
     log_step = args.n_display
     start_time = time.time()
     total_loss = 0
-
     for step, batch in enumerate(train_dataloader):
         if n_gpu == 1:
-            # multi-gpu does scattering it-self
             batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
-
         input_ids, input_mask, segment_ids, video, video_mask = batch
         loss = model(input_ids, segment_ids, input_mask, video, video_mask)
-
         if n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu.
+            loss = loss.mean()
         if args.gradient_accumulation_steps > 1:
             loss = loss / args.gradient_accumulation_steps
-
+        if not torch.isfinite(loss):
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
+            if args.local_rank == 0:
+                logger.warning(f"[skip step] non-finite loss detected: {float(loss)} at global step ~{global_step}")
+            continue
         loss.backward()
-
         total_loss += float(loss)
         if (step + 1) % args.gradient_accumulation_steps == 0:
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
             if scheduler is not None:
-                scheduler.step()  # Update learning rate schedule
-
+                scheduler.step()
             optimizer.step()
-            optimizer.zero_grad()
-
-            # https://github.com/openai/CLIP/issues/46
+            optimizer.zero_grad(set_to_none=True)
             if hasattr(model, 'module'):
                 torch.clamp_(model.module.clip.logit_scale.data, max=np.log(100))
             else:
                 torch.clamp_(model.clip.logit_scale.data, max=np.log(100))
-
+            if hasattr(model, "_ls_warmup"):
+                model._ls_warmup.step()
             global_step += 1
             if global_step % log_step == 0 and local_rank == 0:
                 logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, Time/step: %f", epoch + 1,
@@ -297,7 +325,6 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                             float(loss),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
-
     total_loss = total_loss / len(train_dataloader)
     return total_loss, global_step
 
@@ -320,19 +347,10 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
     return sim_matrix
 
 def eval_epoch(args, model, test_dataloader, device, n_gpu):
-
     if hasattr(model, 'module'):
         model = model.module.to(device)
     else:
         model = model.to(device)
-
-    # #################################################################
-    ## below variables are used to multi-sentences retrieval
-    # multi_sentence_: important tag for eval
-    # cut_off_points: used to tag the label when calculate the metric
-    # sentence_num: used to cut the sentence representation
-    # video_num: used to cut the video representation
-    # #################################################################
     multi_sentence_ = False
     cut_off_points_, sentence_num_, video_num_ = [], -1, -1
     if hasattr(test_dataloader.dataset, 'multi_sentence_per_video') \
@@ -342,11 +360,9 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         sentence_num_ = test_dataloader.dataset.sentence_num
         video_num_ = test_dataloader.dataset.video_num
         cut_off_points_ = [itm - 1 for itm in cut_off_points_]
-
     if multi_sentence_:
         logger.warning("Eval under the multi-sentence per video clip setting.")
         logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
-
     model.eval()
     with torch.no_grad():
         batch_list_t = []
@@ -354,48 +370,38 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         batch_sequence_output_list, batch_visual_output_list = [], []
         batch_seq_features_list = []
         total_video_num = 0
-
-        # ----------------------------
-        # 1. cache the features
-        # ----------------------------
-        for bid, batch in enumerate(test_dataloader): # Maybe something went wrong here!!!
+        for bid, batch in enumerate(test_dataloader):
             batch = tuple(t.to(device) for t in batch)
             input_ids, input_mask, segment_ids, video, video_mask = batch
-
             if multi_sentence_:
-                # multi-sentences retrieval means: one clip has two or more descriptions.
                 b, *_t = video.shape
                 sequence_output, seq_features = model.get_sequence_output(input_ids, segment_ids, input_mask)
                 batch_sequence_output_list.append(sequence_output)
                 batch_seq_features_list.append(seq_features)
                 batch_list_t.append((input_mask, segment_ids,))
-
                 s_, e_ = total_video_num, total_video_num + b
                 filter_inds = [itm - s_ for itm in cut_off_points_ if itm >= s_ and itm < e_]
-
                 if len(filter_inds) > 0:
                     video, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
-                    visual_output = model.get_visual_output(video, video_mask)
+                    try:
+                        text_global = model.clip.encode_text_global(input_ids[filter_inds])
+                    except AttributeError:
+                        text_global = None
+                    visual_output = model.get_visual_output(video, video_mask, text_global=text_global)
                     batch_visual_output_list.append(visual_output)
                     batch_list_v.append((video_mask,))
                 total_video_num += b
             else:
                 (sequence_output, seq_features), visual_output = model.get_sequence_visual_output(input_ids, segment_ids, input_mask, video, video_mask)
-
                 batch_sequence_output_list.append(sequence_output)
                 batch_seq_features_list.append(seq_features)
                 batch_list_t.append((input_mask, segment_ids,))
                 batch_visual_output_list.append(visual_output)
                 batch_list_v.append((video_mask,))
-
             print("{}/{}\r".format(bid, len(test_dataloader)), end="")
-
-        # ----------------------------------
-        # 2. calculate the similarity
-        # ----------------------------------
         sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_seq_features_list, batch_visual_output_list)
         sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
-
+        sim_matrix = np.nan_to_num(sim_matrix, nan=0.0, posinf=1e9, neginf=-1e9)
     if multi_sentence_:
         logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
         cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
@@ -407,7 +413,6 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         sim_matrix = np.stack(tuple(sim_matrix_new), axis=0)
         logger.info("after reshape, sim matrix size: {} x {} x {}".
                     format(sim_matrix.shape[0], sim_matrix.shape[1], sim_matrix.shape[2]))
-
         tv_metrics = tensor_text_to_video_metrics(sim_matrix)
         vt_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix))
     else:
@@ -415,14 +420,12 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         tv_metrics = compute_metrics(sim_matrix)
         vt_metrics = compute_metrics(sim_matrix.T)
         logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix), len(sim_matrix[0])))
-
     logger.info("Text-to-Video:")
     logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                 format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['MR'], tv_metrics['MeanR']))
     logger.info("Video-to-Text:")
     logger.info('\t>>>  V2T$R@1: {:.1f} - V2T$R@5: {:.1f} - V2T$R@10: {:.1f} - V2T$Median R: {:.1f} - V2T$Mean R: {:.1f}'.
                 format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
-
     R1 = tv_metrics['R1']
     return R1
 
@@ -431,54 +434,59 @@ def main():
     args = get_args()
     args = set_seed_logger(args)
     device, n_gpu = init_device(args, args.local_rank)
-
     tokenizer = ClipTokenizer()
-
     assert  args.task_type == "retrieval"
     model = init_model(args, device, n_gpu, args.local_rank)
-
-    ## ####################################
-    # freeze testing
-    ## ####################################
     assert args.freeze_layer_num <= 12 and args.freeze_layer_num >= -1
-    if hasattr(model, "clip") and args.freeze_layer_num > -1:
+    if hasattr(args, 'adapter_only') and args.adapter_only:
+        if args.local_rank == 0:
+            logger.info("***** Adapter-Only Mode: Freezing all CLIP backbone parameters *****")
+        for name, param in model.named_parameters():
+            if '.lorm.' in name or '.lorm' in name.split('.')[-1]:
+                param.requires_grad = True
+            elif 'attn.off_param' in name:
+                param.requires_grad = True
+            elif 'attn.gamma.' in name or 'attn.beta.' in name or 'attn.score_net.' in name:
+                param.requires_grad = True
+            elif 'transformerClip' in name or 'similarity_dense' in name:
+                param.requires_grad = True
+            elif any(x in name for x in ['global_mat_weight', 'word_logit_weight', 'frame_logit_weight',
+                                          'local_mat_weight', 'frame_mat_weight', 'word_mat_weight']):
+                param.requires_grad = True
+            elif name == 'clip.logit_scale' or name == 'logit_scale':
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        if args.local_rank == 0:
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in model.parameters())
+            logger.info("  Trainable parameters: {:,} / {:,} ({:.2f}%)".format(
+                trainable_params, total_params, 100.0 * trainable_params / total_params))
+    elif hasattr(model, "clip") and args.freeze_layer_num > -1:
         for name, param in model.clip.named_parameters():
-            # top layers always need to train
             if name.find("ln_final.") == 0 or name.find("text_projection") == 0 or name.find("logit_scale") == 0 \
                     or name.find("visual.ln_post.") == 0 or name.find("visual.proj") == 0:
-                continue    # need to train
+                continue
             elif name.find("visual.transformer.resblocks.") == 0 or name.find("transformer.resblocks.") == 0:
                 layer_num = int(name.split(".resblocks.")[1].split(".")[0])
                 if layer_num >= args.freeze_layer_num:
-                    continue    # need to train
-
+                    continue
             if args.linear_patch == "3d" and name.find("conv2."):
                 continue
             else:
-                # paramenters which < freeze_layer_num will be freezed
                 param.requires_grad = False
-
-    ## ####################################
-    # dataloader loading
-    ## ####################################
     assert args.datatype in DATALOADER_DICT
-
     assert DATALOADER_DICT[args.datatype]["test"] is not None \
            or DATALOADER_DICT[args.datatype]["val"] is not None
-
     test_dataloader, test_length = None, 0
     if DATALOADER_DICT[args.datatype]["test"] is not None:
         test_dataloader, test_length = DATALOADER_DICT[args.datatype]["test"](args, tokenizer)
-
     if DATALOADER_DICT[args.datatype]["val"] is not None:
         val_dataloader, val_length = DATALOADER_DICT[args.datatype]["val"](args, tokenizer, subset="val")
     else:
         val_dataloader, val_length = test_dataloader, test_length
-
-    ## report validation results if the ["test"] is None
     if test_dataloader is None:
         test_dataloader, test_length = val_dataloader, val_length
-
     if args.local_rank == 0:
         logger.info("***** Running test *****")
         logger.info("  Num examples = %d", test_length)
@@ -486,36 +494,25 @@ def main():
         logger.info("  Num steps = %d", len(test_dataloader))
         logger.info("***** Running val *****")
         logger.info("  Num examples = %d", val_length)
-
-    ## ####################################
-    # train and eval
-    ## ####################################
     if args.do_train:
         train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
         num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
                                         / args.gradient_accumulation_steps) * args.epochs
-
         coef_lr = args.coef_lr
         optimizer, scheduler, model = prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, args.local_rank, coef_lr=coef_lr)
-
         if args.local_rank == 0:
             logger.info("***** Running training *****")
             logger.info("  Num examples = %d", train_length)
             logger.info("  Batch size = %d", args.batch_size)
             logger.info("  Num steps = %d", num_train_optimization_steps * args.gradient_accumulation_steps)
-
         best_score = 0.00001
         best_output_model_file = "None"
-        ## ##############################################################
-        # resume optimizer state besides loss to continue train
-        ## ##############################################################
         resumed_epoch = 0
         if args.resume_model:
             checkpoint = torch.load(args.resume_model, map_location='cpu')
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             resumed_epoch = checkpoint['epoch']+1
             resumed_loss = checkpoint['loss']
-        
         global_step = 0
         for epoch in range(resumed_epoch, args.epochs):
             train_sampler.set_epoch(epoch)
@@ -523,23 +520,16 @@ def main():
                                                scheduler, global_step, local_rank=args.local_rank)
             if args.local_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
-
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
-
-                ## Run on val dataset for selecting best model.
                 logger.info("Eval on val dataset")
                 R1 = eval_epoch(args, model, val_dataloader, device, n_gpu)
-
                 if best_score <= R1:
                     best_score = R1
                     best_output_model_file = output_model_file
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
-
-        ## Test on the best checkpoint
         if args.local_rank == 0:
             model = load_model(-1, args, n_gpu, device, model_file=best_output_model_file)
             eval_epoch(args, model, test_dataloader, device, n_gpu)
-
     elif args.do_eval:
         if args.local_rank == 0:
             eval_epoch(args, model, test_dataloader, device, n_gpu)

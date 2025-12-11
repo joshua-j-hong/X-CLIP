@@ -1,4 +1,5 @@
 import torch
+import random
 from torch.utils.data import DataLoader
 from dataloaders.dataloader_msrvtt_retrieval import MSRVTT_DataLoader
 from dataloaders.dataloader_msrvtt_retrieval import MSRVTT_TrainDataLoader
@@ -7,7 +8,23 @@ from dataloaders.dataloader_lsmdc_retrieval import LSMDC_DataLoader
 from dataloaders.dataloader_activitynet_retrieval import ActivityNet_DataLoader
 from dataloaders.dataloader_didemo_retrieval import DiDeMo_DataLoader
 
+class TokenizerWrapper:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, text, *args, **kwargs):
+        if isinstance(text, str) and random.random() < 0.3:
+            words = text.split()
+            if len(words) > 2:
+                del words[random.randint(0, len(words) - 1)]
+                text = " ".join(words)
+        return self.tokenizer(text, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.tokenizer, name)
+
 def dataloader_msrvtt_train(args, tokenizer):
+    # augmented_tokenizer = TokenizerWrapper(tokenizer)
     msrvtt_dataset = MSRVTT_TrainDataLoader(
         csv_path=args.train_csv,
         json_path=args.data_path,
